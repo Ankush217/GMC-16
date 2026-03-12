@@ -1,0 +1,590 @@
+GMC-16 CPU Architecture Manual
+Game Machine CPU — 16-bit Architecture
+
+Specification Version: 1.0
+Emulator Version: v4
+
+1. Overview
+
+The GMC-16 is a 16-bit game-oriented CPU architecture designed for a fantasy console environment. It integrates:
+
+A 16-bit general-purpose CPU
+
+A sprite and tile GPU
+
+Hardware collision detection
+
+Memory-mapped IO
+
+Bankswitched cartridge ROM
+
+Framebuffer rendering
+
+Assembler with expression evaluation
+
+The system targets retro-style game development, similar to classic consoles like NES/SNES but with a simpler architecture.
+
+Key features:
+
+Feature	Value
+CPU Width	16-bit
+Registers	8 general purpose
+Address space	64 KB
+RAM	8 KB
+ROM window	57 KB
+Cartridge size	>1 MB
+Graphics	256×128 RGB565
+Sprites	256
+Sprite size	16×16
+Tile size	8×8
+Framebuffer	Double buffered
+Frame rate	60 Hz
+2. CPU Architecture
+2.1 Registers
+
+The CPU contains 8 general-purpose registers.
+
+Register	Width	Description
+R0-R7	16-bit	General purpose
+
+Registers can store:
+
+integers
+
+addresses
+
+coordinates
+
+sprite values
+
+2.2 Special Registers
+Register	Description
+PC	Program Counter
+SP	Stack Pointer
+FL	Flag register
+2.3 Flags
+
+The flag register contains:
+
+Flag	Bit	Meaning
+Z	0	Zero
+C	1	Carry
+N	2	Negative
+O	3	Overflow
+3. Memory Architecture
+
+The GMC-16 has a 64 KB address space.
+
+0x0000 ───────────────── RAM
+        8 KB
+0x1FFF ─────────────────
+
+0x2000 ───────────────── ROM (fixed bank)
+        8 KB
+0x3FFF ─────────────────
+
+0x4000 ───────────────── ROM bank window
+        ~48 KB
+0xFEFF ─────────────────
+
+0xFF00 ───────────────── IO Registers
+        256 bytes
+0xFFFF ─────────────────
+3.1 RAM
+0x0000 – 0x1FFF
+
+Size:
+
+8 KB
+
+Used for:
+
+stack
+
+variables
+
+runtime data
+
+3.2 ROM
+
+ROM contains the game cartridge program.
+
+Two sections exist.
+
+Fixed ROM
+0x2000 – 0x3FFF
+
+Always mapped to bank 0.
+
+Size:
+
+8 KB
+
+Usually contains:
+
+boot code
+
+engine
+
+interrupt handlers
+
+Banked ROM
+0x4000 – 0xFEFF
+
+Size:
+
+49,152 bytes
+
+This region can switch between 22 banks.
+
+4. Bankswitching System
+
+The cartridge can contain more than 1 MB of code/data.
+
+Total available ROM:
+
+8 KB fixed
++
+22 × 48 KB banks
+=
+1,064 KB
+4.1 Bank Register
+0xFF30
+
+Write:
+
+select active ROM bank
+
+Read:
+
+returns current bank
+4.2 CPU Instructions
+SETBANK
+SETBANK imm
+
+Switch active bank.
+
+Example
+
+SETBANK 3
+GETBANK
+GETBANK Rd
+
+Reads current bank.
+
+Example
+
+GETBANK R0
+5. GPU Architecture
+
+The GMC-16 includes a 2D graphics processor.
+
+Capabilities:
+
+sprite system
+
+tilemap
+
+framebuffer rendering
+
+collision detection
+
+scrolling
+
+6. Screen Format
+
+Resolution
+
+256 × 128
+
+Pixel format
+
+RGB565
+
+Bit layout
+
+RRRRR GGGGGG BBBBB
+
+Conversion example
+
+0xF800 = red
+0x07E0 = green
+0x001F = blue
+7. Framebuffer System
+
+The GPU uses double buffering.
+
+Buffers:
+
+front buffer
+back buffer
+
+Rendering happens on the back buffer.
+
+Frame swap:
+
+GPU_CMD_FLIP_BUFFER
+8. GPU Commands
+
+Command register
+
+0xFF10
+CLEAR
+0x01
+
+Fill screen with color.
+
+DRAW_SPRITES
+0x02
+
+Draw all visible sprites.
+
+FLIP_BUFFER
+0x03
+
+Swap buffers and display frame.
+
+9. Sprite System
+
+Maximum sprites:
+
+256
+
+Sprite structure
+
+x
+y
+tile_index
+flags
+collision_type
+Sprite Flags
+Bit	Meaning
+0	visible
+1	flip X
+2	flip Y
+3	priority
+10. Collision Detection
+
+Collision uses O(n²) pair testing.
+
+Collision types:
+
+0  NONE
+1  PLAYER
+2  ENEMY
+3  BULLET
+4  ITEM
+
+Registers:
+
+0xFF20 collision flag
+0xFF21 sprite A
+0xFF22 sprite B
+11. Controller Input
+
+Register:
+
+0xFF00
+
+Bit layout
+
+bit0 UP
+bit1 DOWN
+bit2 LEFT
+bit3 RIGHT
+bit4 A
+bit5 B
+bit6 START
+bit7 SELECT
+
+Example
+
+BUTTON R0, 0x10
+
+Tests A button.
+
+12. CPU Instruction Encoding
+
+Each instruction is 16 bits.
+
+[opcode:8][ra:4][rb:4]
+
+Some instructions include extra words.
+
+Example
+
+LOADI R0, 5
+
+Encoding
+
+word1 opcode + register
+word2 immediate value
+13. Instruction Set
+Core
+NOP
+HALT
+Data Movement
+MOV Rd, Rs
+LOAD Rd, [Rs]
+STORE Rd, Rs
+LOADI Rd, imm
+SWAP Rd, Rs
+Arithmetic
+ADD
+SUB
+MUL
+DIV
+INC
+DEC
+NEG
+ABS
+Bitwise
+AND
+OR
+XOR
+NOT
+SHL
+SHR
+Comparison
+CMP Rd, Rs
+Branching
+JMP addr
+JZ addr
+JNZ addr
+JG addr
+JL addr
+Stack
+PUSH Rd
+POP Rd
+CALL addr
+RET
+Random
+RAND Rd
+
+Returns random 16-bit number.
+
+14. Graphics Instructions
+SPRITEPOS
+SPRITEMOVE
+SPRITEIMG
+SPRITEENABLE
+SPRITEDISABLE
+Tilemap
+SETTILE
+GETTILE
+SCROLLX
+SCROLLY
+Drawing
+CLS
+PIXEL
+LINE
+RECT
+15. Timing
+
+Frame synchronization:
+
+WAITVBLANK
+
+Locks game loop to 60 FPS.
+
+Implementation avoids drift accumulation.
+
+16. Timer
+
+Instruction
+
+TIMER Rd
+
+Returns milliseconds since program start.
+
+17. Assembler
+
+The GMC-16 includes a two-pass assembler.
+
+Capabilities:
+
+labels
+
+expressions
+
+constants
+
+multi-bank assembly
+
+Label Example
+loop:
+    INC R0
+    JNZ loop
+Constant Example
+HALF EQU SCREEN_W / 2
+LOADI R0, HALF
+18. Multi-Bank Assembly
+
+The assembler supports bank directives.
+
+BANK FIXED
+BANK 0
+BANK 1
+
+Example
+
+BANK FIXED
+LOADI R0, 10
+
+BANK 3
+LOADI R1, 20
+19. Built-in Constants
+
+Examples:
+
+SCREEN_W
+SCREEN_H
+RAM_START
+RAM_END
+ROM_START
+COL_PLAYER
+COL_ENEMY
+COL_BULLET
+COL_ITEM
+20. Renderer API
+
+Framebuffer renderer interface:
+
+render(pixels, width, height)
+
+Pixels format:
+
+RGB565
+row-major
+Built-in Renderers
+NullRenderer
+
+No display.
+
+CallbackRenderer
+
+Calls Python function.
+
+PygameRenderer
+
+Displays window using pygame.
+
+Keyboard mapping:
+
+Arrow keys → movement
+Z → A
+X → B
+Enter → Start
+Right Shift → Select
+21. Example Program
+LOADI R0, 50
+LOADI R1, 20
+ADD   R0, R1
+
+CLS 0x001F
+
+PIXEL 100, 50, 0xF800
+
+HALT
+
+This program:
+
+R0 = 70
+clears screen blue
+draws a red pixel
+22. Emulator Debugging
+
+Debug step mode:
+
+cpu.step(debug=True)
+
+Shows:
+
+PC
+instruction
+register values
+flags
+23. Disassembler
+
+Example output
+
+0x2000  LOADI R0, 0x002A
+0x2004  ADD   R0, R1
+0x2006  HALT
+24. Performance
+
+Cycle timing is defined per opcode.
+
+Examples:
+
+Instruction	Cycles
+NOP	1
+ADD	1
+MUL	3
+DIV	6
+CALL	4
+CLS	8
+25. Safety Features
+
+The emulator detects:
+
+invalid register indexes
+
+ROM overflow
+
+illegal opcodes
+
+invalid banks
+
+assembler forward references
+
+Errors raise:
+
+CPUFault
+26. Self Test Suite
+
+The emulator includes 11 automated tests verifying:
+
+arithmetic correctness
+
+ROM bounds
+
+register validation
+
+VBlank timing
+
+debug output
+
+disassembler
+
+framebuffer API
+
+collision detection
+
+cycle counting
+
+memory map enforcement
+
+bank switching
+
+27. Summary
+
+The GMC-16 provides a complete retro console architecture with:
+
+simple 16-bit CPU
+
+sprite/tile GPU
+
+1 MB cartridge support
+
+modern debugging tools
+
+flexible assembler
+
+It is designed for:
+
+retro game development
+
+educational CPU architecture
+
+emulator experimentation
