@@ -11,9 +11,12 @@ v2  Collision O(n^2), explicit memory map, GPU command register,
 v3  ROM overflow, register bounds, drift-free VBlank, debug mode, framebuffer API.
 v4  Bankswitching up to 1 MB total cartridge space.
 v5  VRAM-backed tile engine: 8×8 tiles, 32×16 tilemap, scroll/flip, VRAMWR/VRAMRD.
-v6  (this version)
-    Mono 16-bit APU with pyaudio backend.
-    4 independent channels: square / sine / triangle / sawtooth / noise / PCM.
+v6  Mono 16-bit APU with pyaudio backend. 4 channels.
+v7  (this version)
+    Hardware interrupt system: IVT, IME, IE/IF registers.
+    8 sources: VBLANK, TIMER, INPUT, APU, IRQ0-3.
+    New opcodes: SEI 0x3A, CLI 0x3B, RETI 0x3C, TRIG 0x3D.
+    4 channels: square / sine / triangle / sawtooth / noise / PCM.
     22 050 Hz sample rate, background thread, optional pyaudio (silent fallback).
     8 KB audio RAM for PCM samples (PCMWR / PCMRD CPU instructions).
     IO registers 0xFF50-0xFF59 (REG_APU_*).
@@ -99,6 +102,31 @@ VRAM_MAP_END   = VRAM_MAP_BASE + TILEMAP_COLS * TILEMAP_ROWS * 2 - 1  # 0x47FF
 VRAM_USER_BASE = 0x4800
 
 # =============================================================
+# INTERRUPT SYSTEM  (v7)
+# =============================================================
+#  IVT (top of fixed ROM): 0x3FF0 VBLANK 0x3FF2 TIMER 0x3FF4 INPUT
+#                           0x3FF6 APU    0x3FF8-0x3FFE IRQ0-3
+#  IE=0xFF80 enable mask   IF=0xFF81 pending flags
+#  bit0=VBLANK bit1=TIMER bit2=INPUT bit3=APU bits4-7=IRQ0-3
+IVT_BASE    = 0x3FF0
+IVT_VBLANK  = 0x3FF0
+IVT_TIMER   = 0x3FF2
+IVT_INPUT   = 0x3FF4
+IVT_APU     = 0x3FF6
+IVT_IRQ0    = 0x3FF8
+IVT_IRQ1    = 0x3FFA
+IVT_IRQ2    = 0x3FFC
+IVT_IRQ3    = 0x3FFE
+INT_VBLANK  = 0x01
+INT_TIMER   = 0x02
+INT_INPUT   = 0x04
+INT_APU     = 0x08
+INT_IRQ0    = 0x10
+INT_IRQ1    = 0x20
+INT_IRQ2    = 0x40
+INT_IRQ3    = 0x80
+
+# =============================================================
 # BANKSWITCHING  (v4)
 # =============================================================
 #
@@ -153,6 +181,10 @@ REG_APU_PCM_LO      = 0xFF56   # PCM sample start address lo (word index)
 REG_APU_PCM_HI      = 0xFF57   # PCM sample start address hi
 REG_APU_PCM_LEN_LO  = 0xFF58   # PCM sample length lo (in samples)
 REG_APU_PCM_LEN_HI  = 0xFF59   # PCM sample length hi
+REG_IE              = 0xFF80   # Interrupt Enable  (bitmask)
+REG_IF              = 0xFF81   # Interrupt Flags   (write 0 to clear)
+REG_TIMER_PERIOD_LO = 0xFF82   # timer period lo byte (cycles; 0=off)
+REG_TIMER_PERIOD_HI = 0xFF83   # timer period hi byte
 
 
 # =============================================================
@@ -249,6 +281,8 @@ CYCLE_TABLE: dict[int, int] = {
     0x34: 2,  0x35: 1,   # SETBANK, GETBANK
     0x36: 3,  0x37: 3,   # VRAMWR, VRAMRD
     0x38: 3,  0x39: 3,   # PCMWR, PCMRD
+    0x3A: 1,  0x3B: 1,   # SEI, CLI
+    0x3C: 4,  0x3D: 2,   # RETI, TRIG
 }
 
 # Mnemonic name lookup (opcode -> name) used by the disassembler
@@ -271,6 +305,8 @@ _OPCODE_NAMES: dict[int, str] = {
     0x34:"SETBANK", 0x35:"GETBANK",
     0x36:"VRAMWR",  0x37:"VRAMRD",
     0x38:"PCMWR",   0x39:"PCMRD",
+    0x3A:"SEI",     0x3B:"CLI",
+    0x3C:"RETI",    0x3D:"TRIG",
 }
 
 
@@ -533,6 +569,7 @@ class GPU:
         self.framebuffer      = [0] * (SCREEN_W * SCREEN_H)
         self.back_framebuffer = [0] * (SCREEN_W * SCREEN_H)
         self.renderer: FramebufferRenderer = NullRenderer()
+        self._irq_callback = None
 
     # --- VRAM word access ----------------------------------------
 
@@ -639,8 +676,9 @@ class GPU:
     def _cmd_draw_sprites(self):
         """
         Blit all visible sprites onto the back-buffer using VRAM tile data.
-        Each sprite is 16×16 px built from 2×2 tiles starting at tile_index.
+        Each sprite is 16x16 px built from 2x2 tiles starting at tile_index.
         Colour 0x0000 in tile pixel data is transparent.
+        Honours sprite.flip_x (flags bit1) and sprite.flip_y (flags bit2).
         """
         vram = self.vram
         fb   = self.back_framebuffer
@@ -649,21 +687,28 @@ class GPU:
             if not sprite.visible:
                 continue
             base_tid = sprite.tile_index & 0xFF
-            for sty in range(2):
-                for stx in range(2):
-                    tid  = (base_tid + sty * 2 + stx) & 0xFF
+            fx = sprite.flip_x
+            fy = sprite.flip_y
+            for sty in range(2):           # output sub-tile row (screen space)
+                src_sty = (1 - sty) if fy else sty
+                for stx in range(2):       # output sub-tile col (screen space)
+                    src_stx = (1 - stx) if fx else stx
+                    # Source tile index comes from the mirrored sub-tile position
+                    tid   = (base_tid + src_sty * 2 + src_stx) & 0xFF
                     tbase = VRAM_TILE_BASE + tid * TILE_BYTES
                     for py in range(TILE_H):
+                        src_py    = (TILE_H - 1 - py) if fy else py
                         sy_screen = sprite.y + sty * TILE_H + py
                         if not (0 <= sy_screen < SCREEN_H):
                             continue
                         for px in range(TILE_W):
+                            src_px    = (TILE_W - 1 - px) if fx else px
                             sx_screen = sprite.x + stx * TILE_W + px
                             if not (0 <= sx_screen < SCREEN_W):
                                 continue
-                            off   = tbase + (py * TILE_W + px) * 2
+                            off   = tbase + (src_py * TILE_W + src_px) * 2
                             color = vram[off] | (vram[off + 1] << 8)
-                            if color:   # 0x0000 = transparent
+                            if color:
                                 fb[sy_screen * SCREEN_W + sx_screen] = color
 
     def _cmd_flip_buffer(self):
@@ -671,6 +716,11 @@ class GPU:
             self.back_framebuffer, self.framebuffer
         )
         self.renderer.render(self.framebuffer, SCREEN_W, SCREEN_H)
+        if self._irq_callback:
+            self._irq_callback(INT_VBLANK)
+
+    def set_irq_callback(self, cb):
+        self._irq_callback = cb
 
     # --- Sprite control ------------------------------------------
 
@@ -807,6 +857,7 @@ class APU:
         self._stream    = None
         self._pa        = None
         self._running   = False
+        self._irq_callback = None
 
         # Staging registers (written by IO writes before APU_CMD)
         self._reg_chan      = 0
@@ -815,6 +866,9 @@ class APU:
         self._reg_wave      = WAVE_SQUARE
         self._reg_pcm_addr  = 0
         self._reg_pcm_len   = 0
+
+    def set_irq_callback(self, cb):
+        self._irq_callback = cb
 
     # --- Audio RAM -----------------------------------------------
 
@@ -898,6 +952,8 @@ class APU:
                     for i in range(n_frames):
                         if ch.pcm_pos >= ch.pcm_len:
                             ch.active = False
+                            if self._irq_callback:
+                                self._irq_callback(INT_APU)
                             break
                         waddr = (ch.pcm_start + ch.pcm_pos) & 0x1FFF
                         raw   = ram[waddr * 2] | (ram[waddr * 2 + 1] << 8)
@@ -1126,6 +1182,23 @@ class MemoryBus:
         if addr == REG_COLLISION_SPR_A: return self._gpu.collision_spr_a & 0xFF
         if addr == REG_COLLISION_SPR_B: return self._gpu.collision_spr_b & 0xFF
         if addr == REG_BANK:            return self._cur_bank & 0xFF
+        # VRAM DMA read: reading DATA_LO stages the word;
+        # reading DATA_HI returns hi byte and auto-increments addr (mirrors write)
+        if addr == REG_VRAM_DATA_LO:
+            va   = (self._io[REG_VRAM_ADDR_HI - IO_START] << 8) | \
+                    self._io[REG_VRAM_ADDR_LO  - IO_START]
+            word = self._gpu.vram_read(va)
+            self._io[REG_VRAM_DATA_LO - IO_START] = word & 0xFF
+            self._io[REG_VRAM_DATA_HI - IO_START] = (word >> 8) & 0xFF
+            return word & 0xFF
+        if addr == REG_VRAM_DATA_HI:
+            hi  = self._io[REG_VRAM_DATA_HI - IO_START]
+            va  = (self._io[REG_VRAM_ADDR_HI - IO_START] << 8) | \
+                   self._io[REG_VRAM_ADDR_LO  - IO_START]
+            va  = (va + 2) & 0xFFFF
+            self._io[REG_VRAM_ADDR_LO - IO_START] = va & 0xFF
+            self._io[REG_VRAM_ADDR_HI - IO_START] = (va >> 8) & 0xFF
+            return hi
         return self._io[addr - IO_START]
 
     def _io_write(self, addr: int, value: int):
@@ -1146,6 +1219,12 @@ class MemoryBus:
             self._io[REG_VRAM_ADDR_HI - IO_START] = (va >> 8) & 0xFF
         elif REG_APU_CMD <= addr <= REG_APU_PCM_LEN_HI:
             self._apu.handle_register_write(addr, value)
+        elif addr == REG_IF:
+            self._io[REG_IF - IO_START] &= value & 0xFF
+
+    def raise_interrupt(self, mask: int):
+        """Set bits in IF. Called by GPU, APU, and TRIG."""
+        self._io[REG_IF - IO_START] |= mask & 0xFF
 
 
 # =============================================================
@@ -1184,14 +1263,20 @@ class GMC16CPU:
         self.SP = RAM_END - 1
         self.FL = 0
 
-        self.halted       = False
-        self.total_cycles = 0
+        self.halted            = False
+        self.total_cycles      = 0
+        self.IME               = False
+        self._timer_counter    = 0
+        self._last_controller1 = 0x00
 
         # Fix #3: absolute target time avoids drift accumulation
         self._vblank_target = time.monotonic()
         self._frame_time    = 1 / 60
 
         self.controller1: int = 0x00
+
+        self.gpu.set_irq_callback(self.bus.raise_interrupt)
+        self.apu.set_irq_callback(self.bus.raise_interrupt)
 
     # --- Internal helpers ----------------------------------------
 
@@ -1229,9 +1314,12 @@ class GMC16CPU:
         self.PC           = ROM_START
         self.SP           = RAM_END - 1
         self.FL           = 0
-        self.halted       = False
-        self.total_cycles = 0
-        self._vblank_target = time.monotonic()
+        self.halted            = False
+        self.total_cycles      = 0
+        self.IME               = False
+        self._timer_counter    = 0
+        self._last_controller1 = 0
+        self._vblank_target    = time.monotonic()
 
     # --- Debug / disassembly  (Fix #4) ---------------------------
 
@@ -1357,7 +1445,38 @@ class GMC16CPU:
         if debug:
             self._debug_print(pc_before, op, ra, rb)
 
-        self.total_cycles += self._execute(op, ra, rb)
+        cycles = self._execute(op, ra, rb)
+        self.total_cycles += cycles
+
+        if self.controller1 != self._last_controller1:
+            self._last_controller1 = self.controller1
+            self.bus.raise_interrupt(INT_INPUT)
+
+        period = ((self.bus._io[REG_TIMER_PERIOD_HI - IO_START] << 8) |
+                   self.bus._io[REG_TIMER_PERIOD_LO - IO_START])
+        if period:
+            self._timer_counter += cycles
+            if self._timer_counter >= period:
+                self._timer_counter -= period
+                self.bus.raise_interrupt(INT_TIMER)
+
+        self._check_interrupts()
+
+    def _check_interrupts(self):
+        if not self.IME:
+            return
+        ie  = self.bus._io[REG_IE - IO_START]
+        iff = self.bus._io[REG_IF - IO_START]
+        pending = ie & iff
+        if not pending:
+            return
+        bit       = pending & (-pending)
+        bit_index = bit.bit_length() - 1
+        self.bus._io[REG_IF - IO_START] &= ~bit & 0xFF
+        self.IME = False
+        self._push(self.PC)   # push return address first
+        self._push(self.FL)   # push flags on top
+        self.PC = self.bus.read16(IVT_BASE + bit_index * 2)
 
     def _fetch_mixed(self, bus: "MemoryBus", R: list, n: int) -> list:
         """
@@ -1411,7 +1530,7 @@ class GMC16CPU:
         # --- Data movement ---------------------------------------
         elif op == 0x02: wr(rs()); self._update_nz(rs())
         elif op == 0x03: v = bus.read16(rs()); wr(v); self._update_nz(v)
-        elif op == 0x04: bus.write16(rd(), rs())
+        elif op == 0x04: bus.write16(rs(), rd())  # STORE Ra, Rb: mem[Rb] = Ra
         elif op == 0x05: imm = fetch(); wr(imm); self._update_nz(imm)
         elif op == 0x06: R[ra], R[rb] = R[rb], R[ra]
 
@@ -1505,9 +1624,10 @@ class GMC16CPU:
             sid = fetch()
             dx, dy = self._fetch_mixed(bus, R, 2)
             self.gpu.sprite_move(sid, dx, dy)
-        elif op == 0x22:
-            sid, tile = self._fetch_mixed(bus, R, 2)
-            self.gpu.sprite_set_image(sid, tile)
+        elif op == 0x22:          # SPRITEIMG sid_imm, tile (sid always immediate)
+            sid  = fetch()
+            tile = self._fetch_mixed(bus, R, 1)[0]
+            self.gpu.sprite_set_image(sid & 0xFF, tile)
         elif op == 0x23: self.gpu.sprite_enable(fetch())
         elif op == 0x24: self.gpu.sprite_disable(fetch())
 
@@ -1585,6 +1705,17 @@ class GMC16CPU:
             self._check_regs(ra)
             waddr = self._fetch_mixed(bus, R, 1)[0]
             wr(self.apu.read_audio_ram(waddr))
+
+        # --- Interrupts (v7) ---------------------------------
+        elif op == 0x3A: self.IME = True
+        elif op == 0x3B: self.IME = False
+        elif op == 0x3C:          # RETI: pop FL (top), then PC
+            self.FL  = self._pop()
+            self.PC  = self._pop()
+            self.IME = True
+        elif op == 0x3D:          # TRIG n: 0-3 -> IRQ0-3 (bits 4-7)
+            n = fetch() & 0x03
+            self.bus.raise_interrupt(1 << (4 + n))
 
         else:
             raise CPUFault(
@@ -1717,6 +1848,7 @@ class Assembler:
         "SETBANK":0x34,"GETBANK":0x35,
         "VRAMWR":0x36,"VRAMRD":0x37,
         "PCMWR":0x38,"PCMRD":0x39,
+        "SEI":0x3A,"CLI":0x3B,"RETI":0x3C,"TRIG":0x3D,
     }
 
     BUILTINS: dict[str, int] = {
@@ -1746,6 +1878,17 @@ class Assembler:
         "REG_APU_PCM_LEN_LO":REG_APU_PCM_LEN_LO,"REG_APU_PCM_LEN_HI":REG_APU_PCM_LEN_HI,
         "PLAY_TONE":0x01,"PLAY_NOISE":0x02,"SND_STOP":0x03,
         "SND_STOP_ALL":0x04,"PLAY_PCM":0x05,
+        "IVT_VBLANK":IVT_VBLANK,"IVT_TIMER":IVT_TIMER,
+        "IVT_INPUT":IVT_INPUT,"IVT_APU":IVT_APU,
+        "IVT_IRQ0":IVT_IRQ0,"IVT_IRQ1":IVT_IRQ1,
+        "IVT_IRQ2":IVT_IRQ2,"IVT_IRQ3":IVT_IRQ3,
+        "INT_VBLANK":INT_VBLANK,"INT_TIMER":INT_TIMER,
+        "INT_INPUT":INT_INPUT,"INT_APU":INT_APU,
+        "INT_IRQ0":INT_IRQ0,"INT_IRQ1":INT_IRQ1,
+        "INT_IRQ2":INT_IRQ2,"INT_IRQ3":INT_IRQ3,
+        "REG_IE":REG_IE,"REG_IF":REG_IF,
+        "REG_TIMER_PERIOD_LO":REG_TIMER_PERIOD_LO,
+        "REG_TIMER_PERIOD_HI":REG_TIMER_PERIOD_HI,
     }
 
     _IDENT = re.compile(r'\b(?!0[xX])[A-Za-z_][A-Za-z0-9_]*\b')
@@ -1870,9 +2013,16 @@ class Assembler:
                 continue
             if ":" in line:
                 lbl, _, line = line.partition(":")
-                lbl = lbl.strip()
+                lbl  = lbl.strip()
+                rest = line.strip()
+                # "NAME: EQU expr" -- constant, not a code label
+                rparts = rest.split()
+                if rparts and rparts[0].upper() == "EQU":
+                    self.constants[lbl] = self._eval(" ".join(rparts[1:]))
+                    continue
+                # Normal address label
                 self.labels[lbl] = self._current_origin() + len(self.output)
-                line = line.strip()
+                line = rest
                 if not line:
                     continue
             parts = line.split()
@@ -1932,9 +2082,10 @@ class Assembler:
         elif mnem == "SETTILE":
             self._emit16(op << 8)
             self._emit_mixed(args[0], args[1], args[2])
-        elif mnem == "SPRITEIMG":
+        elif mnem == "SPRITEIMG":   # sid: always-immediate; tile: reg-or-imm
             self._emit16(op << 8)
-            self._emit_mixed(args[0], args[1])
+            ex(args[0])             # sid as plain immediate
+            self._emit_mixed(args[1])  # tile as 1 mixed arg
         elif mnem in ("SPRITEENABLE","SPRITEDISABLE","SCROLLX","SCROLLY","CLS"):
             self._emit16(op << 8); ex(args[0])
         elif mnem == "GETTILE":
@@ -1968,6 +2119,11 @@ class Assembler:
         elif mnem == "PCMRD":           # PCMRD Rd, addr
             self._emit16((op << 8) | (reg(args[0]) << 4))
             self._emit_mixed(args[1])
+        elif mnem in ("SEI", "CLI", "RETI"):
+            self._emit16(op << 8)
+        elif mnem == "TRIG":
+            self._emit16(op << 8)
+            ex(args[0])
         else:
             raise ValueError(f"Unhandled mnemonic: '{mnem}'")
 
@@ -2372,8 +2528,184 @@ def _run_tests():
 
     print("  PASS")
 
+
+    # ------------------------------------------------------------------
+    print("\n[14] Interrupt system (v7)")
+    a14 = Assembler()
+
+    # SEI / CLI
+    c = GMC16CPU(); a14.assemble("SEI\nHALT").load_into(c.bus)
+    c.reset(); c.run(max_steps=50)
+    assert c.IME == True,  "SEI must set IME"
+    c = GMC16CPU(); a14.assemble("CLI\nHALT").load_into(c.bus)
+    c.reset(); c.run(max_steps=50)
+    assert c.IME == False, "CLI must clear IME"
+    print("  SEI / CLI: PASS")
+
+    # TRIG 0 + RETI
+    # Fixed ROM 0x2000: SEI(2) TRIG0(4) HALT(2) -> handler@0x2008
+    MAGIC = 0xBEEF; TARGET = 0x0010
+    cpu_t = GMC16CPU()
+    a14.assemble(
+        "BANK FIXED\n"
+        "SEI\n"
+        "TRIG 0\n"
+        "HALT\n"
+        "handler:\n"
+        f"LOADI  R0, {0xBEEF}\n"
+        f"LOADI  R1, {0x0010}\n"
+        "STORE  R0, R1\n"
+        "RETI\n"
+    ).load_into(cpu_t.bus)
+    off = IVT_IRQ0 - BANK_FIXED_START
+    ha  = BANK_FIXED_START + 8
+    cpu_t.bus._rom_fixed[off]     = ha & 0xFF
+    cpu_t.bus._rom_fixed[off + 1] = (ha >> 8) & 0xFF
+    cpu_t.bus._io[REG_IE - IO_START] = INT_IRQ0
+    cpu_t.reset(); cpu_t.run(max_steps=500)
+    got = cpu_t.bus.read16(TARGET)
+    assert got == MAGIC, f"IRQ0 handler not run: 0x{got:04X}"
+    print("  TRIG / RETI dispatch: PASS")
+
+    # Timer sets IF
+    cpu_tmr = GMC16CPU()
+    a14.assemble(
+        "LOADI  R0, 5\n"
+        "LOADI  R7, REG_TIMER_PERIOD_LO\n"
+        "STORE  R0, R7\n"
+        "LOADI  R0, 0\n"
+        "LOADI  R7, REG_TIMER_PERIOD_HI\n"
+        "STORE  R0, R7\n"
+        "NOP\nNOP\nNOP\nNOP\nNOP\nNOP\nNOP\n"
+        "HALT\n"
+    ).load_into(cpu_tmr.bus)
+    cpu_tmr.reset(); cpu_tmr.run(max_steps=200)
+    assert cpu_tmr.bus._io[REG_IF - IO_START] & INT_TIMER, "TIMER IF not set"
+    print("  Timer sets IF: PASS")
+
+    # VBLANK on FLIP_BUFFER
+    cpu_vbl = GMC16CPU()
+    cpu_vbl.gpu._cmd_flip_buffer()
+    assert cpu_vbl.bus._io[REG_IF - IO_START] & INT_VBLANK, "VBLANK not set"
+    print("  VBLANK sets IF on FLIP_BUFFER: PASS")
+
+    # REG_IF write-to-clear
+    cpu_vbl.bus._io[REG_IF - IO_START] = 0xFF
+    cpu_vbl.bus.write(REG_IF, ~INT_VBLANK & 0xFF)
+    if_after = cpu_vbl.bus._io[REG_IF - IO_START]
+    assert not (if_after & INT_VBLANK), "VBLANK not cleared"
+    assert     (if_after & INT_TIMER),  "other bits must remain"
+    print("  REG_IF write-to-clear: PASS")
+
+    # IME=False blocks dispatch
+    cpu_nd = GMC16CPU()
+    cpu_nd.bus._io[REG_IE - IO_START] = INT_IRQ0
+    cpu_nd.bus._io[REG_IF - IO_START] = INT_IRQ0
+    cpu_nd.IME = False
+    pc0 = cpu_nd.PC
+    cpu_nd._check_interrupts()
+    assert cpu_nd.PC == pc0, "PC changed when IME=False"
+    print("  IME=False blocks dispatch: PASS")
+
+    print("  PASS")
+
+    # ------------------------------------------------------------------
+    print("\n[15] Bug fixes (v7.1)")
+
+    # Fix 1: TRIG 0 sets INT_IRQ0 (bit 4), NOT INT_VBLANK (bit 0)
+    cpu_tm = GMC16CPU()
+    Assembler().assemble("TRIG 0\nHALT").load_into(cpu_tm.bus)
+    cpu_tm.bus._io[REG_IE - IO_START] = 0xFF
+    cpu_tm.IME = False
+    cpu_tm.reset()
+    cpu_tm.bus._io[REG_IE - IO_START] = 0xFF
+    cpu_tm.IME = False
+    cpu_tm.run(max_steps=50)
+    ifv = cpu_tm.bus._io[REG_IF - IO_START]
+    assert ifv & INT_IRQ0,        f"TRIG 0 must set INT_IRQ0: IF=0x{ifv:02X}"
+    assert not (ifv & INT_VBLANK),f"TRIG 0 must not set VBLANK: IF=0x{ifv:02X}"
+    print("  TRIG mask (IRQ0=bit4): PASS")
+
+    # Fix 2: PUSH/POP order -- stack balanced after RETI
+    cpu_st = GMC16CPU()
+    Assembler().assemble(
+        "BANK FIXED\nSEI\nTRIG 0\nHALT\nhandler:\nRETI"
+    ).load_into(cpu_st.bus)
+    off2 = IVT_IRQ0 - BANK_FIXED_START
+    ha2  = BANK_FIXED_START + 8
+    cpu_st.bus._rom_fixed[off2]     = ha2 & 0xFF
+    cpu_st.bus._rom_fixed[off2 + 1] = (ha2 >> 8) & 0xFF
+    cpu_st.bus._io[REG_IE - IO_START] = INT_IRQ0
+    cpu_st.reset()
+    sp0 = cpu_st.SP
+    cpu_st.run(max_steps=200)
+    assert cpu_st.SP == sp0, f"Stack unbalanced: SP=0x{cpu_st.SP:04X} != 0x{sp0:04X}"
+    assert cpu_st.halted
+    print("  PUSH/POP order (stack balanced after RETI): PASS")
+
+    # Fix 3: SPRITEIMG sid always-immediate
+    cpu_si = GMC16CPU()
+    Assembler().assemble("SPRITEIMG 3, 7\nHALT").load_into(cpu_si.bus)
+    cpu_si.reset(); cpu_si.run(max_steps=50)
+    assert cpu_si.gpu.sprites[3].tile_index == 7
+    print("  SPRITEIMG sid-immediate: PASS")
+
+    # Fix 4: EQU colon syntax
+    asm_eq = Assembler()
+    img_eq = asm_eq.assemble("ANSWER: EQU 42\nLOADI R0, ANSWER\nHALT")
+    cpu_eq = GMC16CPU()
+    img_eq.load_into(cpu_eq.bus)
+    cpu_eq.reset(); cpu_eq.run(max_steps=50)
+    assert cpu_eq.R[0] == 42,                     f"EQU: R0={cpu_eq.R[0]}"
+    assert "ANSWER" not in asm_eq.labels,          "ANSWER should not be a label"
+    assert asm_eq.constants.get("ANSWER") == 42,  "ANSWER should be in constants"
+    print("  EQU colon syntax: PASS")
+
+    # Fix 5: VRAM read auto-increment
+    gpu_vr = GPU()
+    RED16  = 0xF800; BLUE16 = 0x001F
+    gpu_vr.vram_write(0x0000, RED16)
+    gpu_vr.vram_write(0x0002, BLUE16)
+    bus_vr = MemoryBus(gpu_vr)
+    bus_vr.write(REG_VRAM_ADDR_LO, 0x00)
+    bus_vr.write(REG_VRAM_ADDR_HI, 0x00)
+    lo1 = bus_vr.read(REG_VRAM_DATA_LO)
+    hi1 = bus_vr.read(REG_VRAM_DATA_HI)   # auto-increments to 0x0002
+    assert (lo1 | (hi1 << 8)) == RED16,  f"VRAM read[0]=0x{lo1|(hi1<<8):04X}"
+    lo2 = bus_vr.read(REG_VRAM_DATA_LO)
+    hi2 = bus_vr.read(REG_VRAM_DATA_HI)
+    assert (lo2 | (hi2 << 8)) == BLUE16, f"VRAM read[1]=0x{lo2|(hi2<<8):04X}"
+    print("  VRAM read auto-increment: PASS")
+
+    # Fix 6: Sprite flip_x / flip_y
+    RED16 = 0xF800
+    # Tile with left column red, rest black
+    col_stripe = [RED16 if px == 0 else 0x0000
+                  for py in range(TILE_H) for px in range(TILE_W)]
+    gpu_sf = GPU()
+    for t in range(4): gpu_sf.load_tile(t, col_stripe)
+    s = gpu_sf.sprites[0]
+    s.tile_index = 0; s.x = 0; s.y = 0; s.flags = 0x01  # visible
+    gpu_sf._cmd_clear(0x0000); gpu_sf._cmd_draw_sprites()
+    assert gpu_sf.back_framebuffer[0] == RED16,   "no-flip: (0,0) RED"
+    assert gpu_sf.back_framebuffer[1] == 0x0000,  "no-flip: (1,0) black"
+    s.flags = 0x01 | 0x02  # flip_x
+    gpu_sf._cmd_clear(0x0000); gpu_sf._cmd_draw_sprites()
+    assert gpu_sf.back_framebuffer[0] == 0x0000,              "flip_x: (0,0) black"
+    assert gpu_sf.back_framebuffer[TILE_W * 2 - 1] == RED16, "flip_x: right edge RED"
+    # Tile with top row red, rest black
+    row_stripe = [RED16 if py == 0 else 0x0000
+                  for py in range(TILE_H) for px in range(TILE_W)]
+    for t in range(4): gpu_sf.load_tile(t, row_stripe)
+    s.flags = 0x01 | 0x04  # flip_y
+    gpu_sf._cmd_clear(0x0000); gpu_sf._cmd_draw_sprites()
+    assert gpu_sf.back_framebuffer[0] == 0x0000,                          "flip_y: top black"
+    assert gpu_sf.back_framebuffer[(TILE_H*2 - 1)*SCREEN_W] == RED16,     "flip_y: bottom RED"
+    print("  Sprite flip_x / flip_y: PASS")
+
+    print("  PASS")
     print("\n" + "=" * 64)
-    print("All 13 tests passed!")
+    print("All 15 tests passed!")
     print("=" * 64)
 
 
